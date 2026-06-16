@@ -37,6 +37,13 @@ private:
     void processRequest(Client& client);
     void buildErrorResponse(Client& client, int code, const std::string& msg = "");
 
+    std::string resolvePath(const Client& client) const;
+    void handleGet(Client& client);
+    void serveFile(Client& client, const std::string& path);
+    void serveDirectory(Client& client, const std::string& path);
+    void serveDirectoryListing(Client& client, const std::string& path);
+    std::string getContentType(const std::string& path) const;
+
     std::vector<ServerConfig> configs_;
     std::vector<struct pollfd> fds_;
     std::map<int, Client> clients_;

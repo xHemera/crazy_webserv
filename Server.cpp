@@ -7,7 +7,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <sstream>
+#include <vector>
 
 Server::Server(const std::vector<ServerConfig>& configs)
     : configs_(configs), listen_count_(0) {
@@ -248,16 +251,7 @@ void Server::processRequest(Client& client) {
 
     // 3. Delegate to handler based on method
     if (method == "GET") {
-        HttpResponse resp;
-        resp.setStatus(200);
-        std::ostringstream body;
-        body << "<html><body>"
-             << "<h1>" << client.request.method << " " << client.request.path << "</h1>"
-             << "<p>Location: " << client.location->path << "</p>"
-             << "<p>Root: " << client.location->root << "</p>"
-             << "</body></html>";
-        resp.setBody(body.str());
-        client.response = resp.toString();
+        handleGet(client);
     } else if (method == "POST") {
         HttpResponse resp;
         resp.setStatus(200);
@@ -277,6 +271,136 @@ void Server::processRequest(Client& client) {
     } else {
         buildErrorResponse(client, 501);
     }
+}
+
+// Resolve the filesystem path for a request: root + subpath after location prefix.
+std::string Server::resolvePath(const Client& client) const {
+    std::string subpath;
+    if (client.location->path == "/") {
+        subpath = client.request.path;
+    } else {
+        subpath = client.request.path.substr(client.location->path.size());
+    }
+    if (subpath.empty())
+        subpath = "/";
+    return client.location->root + subpath;
+}
+
+// Map file extension to MIME type.
+std::string Server::getContentType(const std::string& path) const {
+    size_t dot = path.rfind('.');
+    if (dot == std::string::npos)
+        return "application/octet-stream";
+
+    std::string ext = path.substr(dot);
+    if (ext == ".html" || ext == ".htm")  return "text/html";
+    if (ext == ".css")                    return "text/css";
+    if (ext == ".js")                     return "application/javascript";
+    if (ext == ".png")                    return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg")  return "image/jpeg";
+    if (ext == ".gif")                    return "image/gif";
+    if (ext == ".svg")                    return "image/svg+xml";
+    if (ext == ".txt")                    return "text/plain";
+    if (ext == ".json")                   return "application/json";
+    if (ext == ".pdf")                    return "application/pdf";
+    if (ext == ".ico")                    return "image/x-icon";
+    return "application/octet-stream";
+}
+
+// Read a file from disk and serve it.
+void Server::serveFile(Client& client, const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        buildErrorResponse(client, 403);
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        buildErrorResponse(client, 500);
+        return;
+    }
+
+    size_t size = static_cast<size_t>(st.st_size);
+    std::vector<char> buf(size);
+    ssize_t n = 0;
+    if (size > 0)
+        n = read(fd, &buf[0], size);
+    close(fd);
+
+    if (n < 0 || static_cast<size_t>(n) != size) {
+        buildErrorResponse(client, 500);
+        return;
+    }
+
+    HttpResponse resp;
+    resp.setStatus(200);
+    resp.setContentType(getContentType(path));
+    resp.setBody(std::string(buf.begin(), buf.end()));
+    client.response = resp.toString();
+}
+
+// Generate an HTML directory listing.
+void Server::serveDirectoryListing(Client& client, const std::string& path) {
+    DIR* dir = opendir(path.c_str());
+    if (!dir) {
+        buildErrorResponse(client, 403);
+        return;
+    }
+
+    std::ostringstream html;
+    html << "<html><head><title>Index of " << client.request.path
+         << "</title></head><body>"
+         << "<h1>Index of " << client.request.path << "</h1><hr><ul>";
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        std::string name(entry->d_name);
+        if (name == ".")
+            continue;
+        html << "<li><a href=\"" << name << "\">" << name << "</a></li>";
+    }
+    html << "</ul><hr></body></html>";
+    closedir(dir);
+
+    HttpResponse resp;
+    resp.setStatus(200);
+    resp.setContentType("text/html");
+    resp.setBody(html.str());
+    client.response = resp.toString();
+}
+
+// Handle a directory request: try index file, then autoindex or 403.
+void Server::serveDirectory(Client& client, const std::string& path) {
+    std::string index_path = path + "/" + client.location->index;
+    struct stat st;
+    if (stat(index_path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+        serveFile(client, index_path);
+        return;
+    }
+    if (client.location->autoindex)
+        serveDirectoryListing(client, path);
+    else
+        buildErrorResponse(client, 403);
+}
+
+// Handle GET: resolve path, stat, then delegate to file or directory handler.
+void Server::handleGet(Client& client) {
+    std::string fullpath = resolvePath(client);
+
+    struct stat st;
+    if (stat(fullpath.c_str(), &st) < 0) {
+        buildErrorResponse(client, 404);
+        return;
+    }
+
+    if (S_ISDIR(st.st_mode))
+        serveDirectory(client, fullpath);
+    else if (S_ISREG(st.st_mode))
+        serveFile(client, fullpath);
+    else
+        buildErrorResponse(client, 403);
 }
 
 // Close a client connection and mark its poll entry as dead.
