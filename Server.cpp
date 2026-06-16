@@ -217,12 +217,24 @@ void Server::buildErrorResponse(Client& client, int code, const std::string& msg
 
     std::map<int, std::string>::const_iterator it = client.config->error_pages.find(code);
     if (it != client.config->error_pages.end()) {
-        // ponytail: file-based error pages deferred — serve hardcoded for now
-        resp.setBody(HttpResponse::errorPage(code, msg));
-    } else {
-        resp.setBody(HttpResponse::errorPage(code, msg));
+        std::string error_path = "./www" + it->second;
+        struct stat st;
+        if (stat(error_path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            int fd = open(error_path.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                std::vector<char> buf(static_cast<size_t>(st.st_size));
+                ssize_t n = read(fd, &buf[0], static_cast<size_t>(st.st_size));
+                close(fd);
+                if (n > 0) {
+                    resp.setBody(std::string(buf.begin(), buf.end()));
+                    client.response = resp.toString();
+                    return;
+                }
+            }
+        }
     }
 
+    resp.setBody(HttpResponse::errorPage(code, msg));
     client.response = resp.toString();
 }
 
