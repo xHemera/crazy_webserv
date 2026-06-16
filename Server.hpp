@@ -39,6 +39,8 @@ private:
 
     std::string resolvePath(const Client& client) const;
     void handleGet(Client& client);
+    void handlePost(Client& client);
+    void handleDelete(Client& client);
     void serveFile(Client& client, const std::string& path);
     void serveDirectory(Client& client, const std::string& path);
     void serveDirectoryListing(Client& client, const std::string& path);

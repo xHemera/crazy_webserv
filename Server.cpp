@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <ctime>
 #include <sstream>
 #include <vector>
 
@@ -253,21 +254,9 @@ void Server::processRequest(Client& client) {
     if (method == "GET") {
         handleGet(client);
     } else if (method == "POST") {
-        HttpResponse resp;
-        resp.setStatus(200);
-        std::ostringstream body;
-        body << "<html><body>"
-             << "<h1>POST " << path << "</h1>"
-             << "<p>Location: " << client.location->path << "</p>"
-             << "<p>Body size: " << client.request.body.size() << "</p>"
-             << "</body></html>";
-        resp.setBody(body.str());
-        client.response = resp.toString();
+        handlePost(client);
     } else if (method == "DELETE") {
-        HttpResponse resp;
-        resp.setStatus(204);
-        resp.setBody("");
-        client.response = resp.toString();
+        handleDelete(client);
     } else {
         buildErrorResponse(client, 501);
     }
@@ -401,6 +390,76 @@ void Server::handleGet(Client& client) {
         serveFile(client, fullpath);
     else
         buildErrorResponse(client, 403);
+}
+
+// Handle POST: write body to upload_store or acknowledge.
+void Server::handlePost(Client& client) {
+    const std::string& upload_store = client.location->upload_store;
+
+    // ponytail: without upload_store, just acknowledge the body
+    if (!upload_store.empty()) {
+        std::ostringstream filename;
+        filename << time(NULL) << "_" << client.request.body.size();
+
+        std::string filepath = upload_store + "/" + filename.str();
+        int fd = open(filepath.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) {
+            buildErrorResponse(client, 500);
+            return;
+        }
+
+        ssize_t written = write(fd, client.request.body.c_str(), client.request.body.size());
+        close(fd);
+
+        if (written < 0 || static_cast<size_t>(written) != client.request.body.size()) {
+            unlink(filepath.c_str());
+            buildErrorResponse(client, 500);
+            return;
+        }
+
+        HttpResponse resp;
+        resp.setStatus(201);
+        resp.setContentType("text/html");
+        std::string body = "<html><body><h1>201 Created</h1><p>File: " + filepath + "</p></body></html>";
+        resp.setBody(body);
+        client.response = resp.toString();
+    } else {
+        HttpResponse resp;
+        resp.setStatus(200);
+        std::ostringstream body;
+        body << "<html><body>"
+             << "<h1>POST " << client.request.path << "</h1>"
+             << "<p>Body size: " << client.request.body.size() << "</p>"
+             << "</body></html>";
+        resp.setBody(body.str());
+        client.response = resp.toString();
+    }
+}
+
+// Handle DELETE: remove file from disk.
+void Server::handleDelete(Client& client) {
+    std::string fullpath = resolvePath(client);
+
+    struct stat st;
+    if (stat(fullpath.c_str(), &st) < 0) {
+        buildErrorResponse(client, 404);
+        return;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        buildErrorResponse(client, 403);
+        return;
+    }
+
+    if (unlink(fullpath.c_str()) < 0) {
+        buildErrorResponse(client, 403);
+        return;
+    }
+
+    HttpResponse resp;
+    resp.setStatus(204);
+    resp.setBody("");
+    client.response = resp.toString();
 }
 
 // Close a client connection and mark its poll entry as dead.
