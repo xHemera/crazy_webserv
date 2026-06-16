@@ -25,6 +25,8 @@ private:
     struct Token {
         TokenType type;
         std::string value;
+        Token() : type(TOKEN_EOF) {}
+        Token(TokenType t, const std::string& v = "") : type(t), value(v) {}
     };
 
     std::string content_;
@@ -41,14 +43,13 @@ private:
     std::vector<ServerConfig> parseConfig();
     ServerConfig parseServer();
     LocationConfig parseLocation();
+    std::vector<std::string> readDirectiveArgs(const std::string& name);
     void parseListen(ServerConfig& server, const std::vector<std::string>& args);
     void parseServerName(ServerConfig& server, const std::vector<std::string>& args);
     void parseClientMaxBodySize(ServerConfig& server, const std::vector<std::string>& args);
     void parseErrorPage(ServerConfig& server, const std::vector<std::string>& args);
 
     void checkDuplicatePorts(const std::vector<ServerConfig>& configs);
-
-    static size_t parseSize(const std::string& str);
 };
 
 #endif
