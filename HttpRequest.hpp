@@ -24,9 +24,12 @@ private:
     void parseHeaderLine(const std::string& line);
 
     enum State { REQUEST_LINE, HEADERS, BODY, COMPLETE };
+    enum ChunkState { CHUNK_SIZE, CHUNK_DATA };
     State state_;
+    ChunkState chunk_state_;
     std::string buf_;
     size_t content_length_;
+    size_t chunk_remaining_;
     bool chunked_;
 };
 

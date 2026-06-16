@@ -12,6 +12,7 @@
 #include <ctime>
 #include <sstream>
 #include <vector>
+#include <sys/wait.h>
 
 Server::Server(const std::vector<ServerConfig>& configs)
     : configs_(configs), listen_count_(0) {
@@ -250,8 +251,31 @@ void Server::processRequest(Client& client) {
         return;
     }
 
-    // 3. Delegate to handler based on method
-    if (method == "GET") {
+    // 3. Check body size against client_max_body_size
+    if (client.request.body.size() > client.config->client_max_body_size) {
+        buildErrorResponse(client, 413);
+        return;
+    }
+
+    // 4. Check CGI extension
+    bool is_cgi = false;
+    if (!client.location->cgi_ext.empty()) {
+        size_t dot = client.request.path.rfind('.');
+        if (dot != std::string::npos) {
+            std::string ext = client.request.path.substr(dot);
+            for (size_t i = 0; i < client.location->cgi_ext.size(); ++i) {
+                if (client.location->cgi_ext[i] == ext) {
+                    is_cgi = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 5. Delegate to handler
+    if (is_cgi) {
+        handleCGI(client);
+    } else if (method == "GET") {
         handleGet(client);
     } else if (method == "POST") {
         handlePost(client);
@@ -459,6 +483,163 @@ void Server::handleDelete(Client& client) {
     HttpResponse resp;
     resp.setStatus(204);
     resp.setBody("");
+    client.response = resp.toString();
+}
+
+// Handle CGI: fork + execve with pipes and environment.
+void Server::handleCGI(Client& client) {
+    std::string script_path = resolvePath(client);
+
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+    if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0) {
+        buildErrorResponse(client, 500);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(stdin_pipe[0]); close(stdin_pipe[1]);
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+        buildErrorResponse(client, 500);
+        return;
+    }
+
+    if (pid == 0) {
+        // Child process
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        close(stdin_pipe[0]);  close(stdin_pipe[1]);
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+
+        // Build environment
+        std::vector<std::string> env_strings;
+        std::vector<char*> envp;
+
+        env_strings.push_back("REQUEST_METHOD=" + client.request.method);
+        env_strings.push_back("QUERY_STRING=" + client.request.query_string);
+        {
+            std::ostringstream ps; ps << client.config->port;
+            env_strings.push_back("SERVER_PORT=" + ps.str());
+        }
+        {
+            std::string sn = client.config->server_name;
+            if (sn.empty()) sn = "localhost";
+            env_strings.push_back("SERVER_NAME=" + sn);
+        }
+        env_strings.push_back("SERVER_PROTOCOL=" + client.request.http_version);
+
+        std::ostringstream cl;
+        cl << client.request.body.size();
+        env_strings.push_back("CONTENT_LENGTH=" + cl.str());
+
+        std::map<std::string, std::string>::const_iterator hit;
+        hit = client.request.headers.find("content-type");
+        if (hit != client.request.headers.end())
+            env_strings.push_back("CONTENT_TYPE=" + hit->second);
+
+        // ponytail: basic SCRIPT_NAME / PATH_INFO / PATH_TRANSLATED
+        env_strings.push_back("SCRIPT_NAME=" + client.request.path);
+        env_strings.push_back("PATH_INFO=");
+        env_strings.push_back("PATH_TRANSLATED=" + script_path);
+
+        hit = client.request.headers.find("host");
+        if (hit != client.request.headers.end())
+            env_strings.push_back("HTTP_HOST=" + hit->second);
+        hit = client.request.headers.find("user-agent");
+        if (hit != client.request.headers.end())
+            env_strings.push_back("HTTP_USER_AGENT=" + hit->second);
+        hit = client.request.headers.find("accept");
+        if (hit != client.request.headers.end())
+            env_strings.push_back("HTTP_ACCEPT=" + hit->second);
+
+        for (size_t i = 0; i < env_strings.size(); ++i)
+            envp.push_back(const_cast<char*>(env_strings[i].c_str()));
+        envp.push_back(NULL);
+
+        // Determine interpreter for .py scripts
+        char* argv[3];
+        argv[0] = const_cast<char*>("/usr/bin/python3");
+        argv[1] = const_cast<char*>(script_path.c_str());
+        argv[2] = NULL;
+
+        execve(argv[0], argv, &envp[0]);
+        // If execve fails, try direct execution (for compiled CGI)
+        argv[0] = const_cast<char*>(script_path.c_str());
+        execve(argv[0], argv, &envp[0]);
+        exit(1);
+    }
+
+    // Parent process
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    if (!client.request.body.empty())
+        write(stdin_pipe[1], client.request.body.c_str(), client.request.body.size());
+    close(stdin_pipe[1]);
+
+    // Read CGI output (blocking read on pipe is OK per subject)
+    std::string cgi_output;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(stdout_pipe[0], buf, sizeof(buf))) > 0)
+        cgi_output.append(buf, static_cast<size_t>(n));
+    close(stdout_pipe[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    // Parse CGI output: headers separated from body by \n\n or \r\n\r\n
+    HttpResponse resp;
+    resp.setStatus(200);
+
+    // Find header/body boundary
+    size_t header_end = std::string::npos;
+    size_t sep_len = 0;
+    size_t pos_rnrn = cgi_output.find("\r\n\r\n");
+    size_t pos_nn  = cgi_output.find("\n\n");
+    if (pos_rnrn != std::string::npos) {
+        header_end = pos_rnrn;
+        sep_len = 4;
+    } else if (pos_nn != std::string::npos) {
+        header_end = pos_nn;
+        sep_len = 2;
+    }
+
+    if (header_end != std::string::npos) {
+        std::string header_section = cgi_output.substr(0, header_end);
+        resp.setBody(cgi_output.substr(header_end + sep_len));
+
+        // Parse CGI response headers
+        std::istringstream hss(header_section);
+        std::string hline;
+        while (std::getline(hss, hline)) {
+            if (!hline.empty() && hline[hline.size() - 1] == '\r')
+                hline.erase(hline.size() - 1);
+            size_t colon = hline.find(':');
+            if (colon != std::string::npos) {
+                std::string key = hline.substr(0, colon);
+                std::string val = hline.substr(colon + 1);
+                size_t start = val.find_first_not_of(" \t");
+                if (start != std::string::npos)
+                    val = val.substr(start);
+                if (key == "Content-Type" || key == "content-type")
+                    resp.setContentType(val);
+                else if (key == "Location" || key == "location") {
+                    resp.setStatus(302);
+                    resp.setHeader("Location", val);
+                } else if (key == "Status" || key == "status") {
+                    int sc = 200;
+                    std::istringstream(val) >> sc;
+                    resp.setStatus(sc);
+                }
+            }
+        }
+    } else {
+        // No headers — entire output is body
+        resp.setBody(cgi_output);
+    }
+
     client.response = resp.toString();
 }
 

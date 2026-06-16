@@ -4,10 +4,12 @@
 #include <sstream>
 
 HttpRequest::HttpRequest()
-    : state_(REQUEST_LINE), content_length_(0), chunked_(false) {}
+    : state_(REQUEST_LINE), chunk_state_(CHUNK_SIZE), content_length_(0),
+      chunk_remaining_(0), chunked_(false) {}
 
 void HttpRequest::clear() {
     state_ = REQUEST_LINE;
+    chunk_state_ = CHUNK_SIZE;
     buf_.clear();
     method.clear();
     path.clear();
@@ -16,6 +18,7 @@ void HttpRequest::clear() {
     headers.clear();
     body.clear();
     content_length_ = 0;
+    chunk_remaining_ = 0;
     chunked_ = false;
 }
 
@@ -47,8 +50,41 @@ bool HttpRequest::feed(const std::string& data) {
 
         if (state_ == BODY) {
             if (chunked_) {
-                // ponytail: chunked decoding deferred
-                state_ = COMPLETE;
+                while (state_ == BODY) {
+                    if (chunk_state_ == CHUNK_SIZE) {
+                        size_t pos = buf_.find("\r\n");
+                        if (pos == std::string::npos)
+                            break;
+
+                        std::string size_line = buf_.substr(0, pos);
+                        buf_.erase(0, pos + 2);
+
+                        char* end = NULL;
+                        long raw = std::strtol(size_line.c_str(), &end, 16);
+                        if (raw < 0)
+                            { state_ = COMPLETE; break; }
+                        chunk_remaining_ = static_cast<size_t>(raw);
+
+                        if (chunk_remaining_ == 0) {
+                            // last chunk: skip optional trailer until \r\n
+                            size_t tpos = buf_.find("\r\n");
+                            if (tpos == std::string::npos)
+                                break;
+                            buf_.erase(0, tpos + 2);
+                            state_ = COMPLETE;
+                            break;
+                        }
+                        chunk_state_ = CHUNK_DATA;
+                    }
+
+                    if (chunk_state_ == CHUNK_DATA) {
+                        if (buf_.size() < chunk_remaining_ + 2)
+                            break;
+                        body += buf_.substr(0, chunk_remaining_);
+                        buf_.erase(0, chunk_remaining_ + 2);
+                        chunk_state_ = CHUNK_SIZE;
+                    }
+                }
             } else if (content_length_ > 0) {
                 if (buf_.size() < content_length_)
                     break;
