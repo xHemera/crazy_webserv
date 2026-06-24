@@ -1,5 +1,41 @@
 <!DOCTYPE html>
-<html>
-<head><title>webserv</title></head>
-<body><h1>Welcome to webserv!</h1></body>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>webserv - 42 HTTP Server</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to webserv</h1>
+        <p class="subtitle">A lightweight HTTP/1.1 server written in C++98</p>
+
+        <div class="features">
+            <a href="/upload.html" class="card">
+                <h2>File Upload</h2>
+                <p>Test POST file upload to the server.</p>
+            </a>
+            <a href="/cookie.html" class="card">
+                <h2>Sessions & Cookies</h2>
+                <p>Demonstrates cookie-based session tracking.</p>
+            </a>
+            <a href="/cgi-bin/test.py" class="card">
+                <h2>CGI Environment</h2>
+                <p>View all CGI environment variables passed by the server.</p>
+            </a>
+            <a href="/form.html" class="card">
+                <h2>CGI Form</h2>
+                <p>Send POST data to a CGI script.</p>
+            </a>
+            <a href="/nonexistent" class="card">
+                <h2>404 Error Page</h2>
+                <p>Trigger a custom 404 error response.</p>
+            </a>
+            <a href="/uploads/" class="card">
+                <h2>Directory Listing</h2>
+                <p>Browse the uploads directory with autoindex.</p>
+            </a>
+        </div>
+    </div>
+</body>
 </html>

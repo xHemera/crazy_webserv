@@ -13,6 +13,7 @@
 #include <sstream>
 #include <vector>
 #include <sys/wait.h>
+#include <arpa/inet.h>
 
 Server::Server(const std::vector<ServerConfig>& configs)
     : configs_(configs), listen_count_(0) {
@@ -25,10 +26,19 @@ Server::~Server() {
             close(fds_[i].fd);
 }
 
-// Socket creation for each listen directive in the config.
+// Socket creation: one socket per unique host:port, multiple configs per port (virtual hosting).
 void Server::setupListenSockets() {
+    std::map<std::pair<std::string, int>, size_t> host_port_to_idx;
+
     for (size_t i = 0; i < configs_.size(); ++i) {
         const ServerConfig& conf = configs_[i];
+        std::pair<std::string, int> key(conf.host, conf.port);
+
+        std::map<std::pair<std::string, int>, size_t>::iterator it = host_port_to_idx.find(key);
+        if (it != host_port_to_idx.end()) {
+            listen_configs_[it->second].push_back(&configs_[i]);
+            continue;
+        }
 
         std::ostringstream oss;
         oss << conf.port;
@@ -78,10 +88,36 @@ void Server::setupListenSockets() {
         pfd.revents = 0;
         fds_.push_back(pfd);
 
+        size_t idx = fds_.size() - 1;
+        host_port_to_idx[key] = idx;
+        std::vector<const ServerConfig*> vec;
+        vec.push_back(&configs_[i]);
+        listen_configs_[idx] = vec;
+
         std::cout << "Listening on " << conf.host << ":" << conf.port << std::endl;
         freeaddrinfo(res);
     }
     listen_count_ = fds_.size();
+}
+
+// Close clients that have been idle for too long.
+void Server::checkTimeouts() {
+    time_t now = time(NULL);
+    for (size_t i = listen_count_; i < fds_.size(); ++i) {
+        int fd = fds_[i].fd;
+        if (fd < 0)
+            continue;
+        std::map<int, Client>::iterator it = clients_.find(fd);
+        if (it == clients_.end())
+            continue;
+        if (it->second.reading_done)
+            continue;
+        if (now - it->second.last_activity > 60) {
+            buildErrorResponse(it->second, 408, "Request Timeout");
+            it->second.reading_done = true;
+            fds_[i].events = POLLOUT;
+        }
+    }
 }
 
 // Remove poll entries whose fd was set to -1 (closed clients).
@@ -101,6 +137,7 @@ void Server::cleanupDeadFds() {
 void Server::run() {
     while (true) {
         cleanupDeadFds();
+        checkTimeouts();
 
         int ret = poll(&fds_[0], fds_.size(), -1);
         if (ret < 0) {
@@ -141,8 +178,17 @@ void Server::handleAccept(size_t idx) {
     client.fd = client_fd;
     client.response_sent = 0;
     client.reading_done = false;
-    client.config = &configs_[idx];
+    client.config = listen_configs_[idx][0];
     client.location = NULL;
+    client.last_activity = time(NULL);
+    client.server_candidates = listen_configs_[idx];
+
+    char ip_str[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str)))
+        client.remote_addr = ip_str;
+    else
+        client.remote_addr = "127.0.0.1";
+
     clients_[client_fd] = client;
 
     struct pollfd pfd;
@@ -165,6 +211,7 @@ void Server::handleRead(size_t idx) {
         return;
     }
 
+    client.last_activity = time(NULL);
     client.request.feed(std::string(buf, static_cast<size_t>(n)));
 
     if (client.request.isComplete()) {
@@ -217,7 +264,8 @@ void Server::buildErrorResponse(Client& client, int code, const std::string& msg
 
     std::map<int, std::string>::const_iterator it = client.config->error_pages.find(code);
     if (it != client.config->error_pages.end()) {
-        std::string error_path = "./www" + it->second;
+        std::string root = client.location ? client.location->root : "./www";
+        std::string error_path = root + it->second;
         struct stat st;
         if (stat(error_path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
             int fd = open(error_path.c_str(), O_RDONLY);
@@ -227,7 +275,7 @@ void Server::buildErrorResponse(Client& client, int code, const std::string& msg
                 close(fd);
                 if (n > 0) {
                     resp.setBody(std::string(buf.begin(), buf.end()));
-                    client.response = resp.toString();
+                    sendResponse(client, resp);
                     return;
                 }
             }
@@ -235,13 +283,40 @@ void Server::buildErrorResponse(Client& client, int code, const std::string& msg
     }
 
     resp.setBody(HttpResponse::errorPage(code, msg));
-    client.response = resp.toString();
+    sendResponse(client, resp);
 }
 
 // Route the completed request: match location, check method, produce a response.
 void Server::processRequest(Client& client) {
     const std::string& method = client.request.method;
     const std::string& path = client.request.path;
+
+    // 0. Session / cookie handling
+    handleSession(client);
+
+    // 0.5 Virtual host routing: choose config based on Host header
+    std::string host_header;
+    std::map<std::string, std::string>::const_iterator hit = client.request.headers.find("host");
+    if (hit != client.request.headers.end()) {
+        host_header = hit->second;
+        size_t colon = host_header.find(':');
+        if (colon != std::string::npos)
+            host_header = host_header.substr(0, colon);
+    }
+    const ServerConfig* chosen = client.server_candidates[0];
+    for (size_t i = 0; i < client.server_candidates.size(); ++i) {
+        if (client.server_candidates[i]->server_name == host_header) {
+            chosen = client.server_candidates[i];
+            break;
+        }
+    }
+    client.config = chosen;
+
+    // 0.5 Validate HTTP version
+    if (client.request.http_version != "HTTP/1.1") {
+        buildErrorResponse(client, 505);
+        return;
+    }
 
     // 1. Match location
     client.location = matchLocation(path, client.config);
@@ -250,8 +325,17 @@ void Server::processRequest(Client& client) {
         return;
     }
 
+    // 1.5 Check redirect
+    if (client.location->has_redirect) {
+        HttpResponse resp;
+        resp.setStatus(client.location->redirect_code);
+        resp.setHeader("Location", client.location->redirect_url);
+        resp.setBody(HttpResponse::errorPage(client.location->redirect_code, "Redirect"));
+        sendResponse(client, resp);
+        return;
+    }
+
     // 2. Check allowed methods
-    // ponytail: only GET/POST/DELETE are handled; everything else is 501
     if (method != "GET" && method != "POST" && method != "DELETE") {
         buildErrorResponse(client, 501);
         return;
@@ -305,9 +389,20 @@ std::string Server::resolvePath(const Client& client) const {
         subpath = client.request.path;
     } else {
         subpath = client.request.path.substr(client.location->path.size());
+        if (subpath.empty() || subpath[0] != '/')
+            subpath = client.request.path;
     }
     if (subpath.empty())
         subpath = "/";
+
+    // Reject path traversal attempts
+    std::istringstream iss(subpath);
+    std::string segment;
+    while (std::getline(iss, segment, '/')) {
+        if (segment == "..")
+            return "";
+    }
+
     return client.location->root + subpath;
 }
 
@@ -363,7 +458,7 @@ void Server::serveFile(Client& client, const std::string& path) {
     resp.setStatus(200);
     resp.setContentType(getContentType(path));
     resp.setBody(std::string(buf.begin(), buf.end()));
-    client.response = resp.toString();
+    sendResponse(client, resp);
 }
 
 // Generate an HTML directory listing.
@@ -393,7 +488,7 @@ void Server::serveDirectoryListing(Client& client, const std::string& path) {
     resp.setStatus(200);
     resp.setContentType("text/html");
     resp.setBody(html.str());
-    client.response = resp.toString();
+    sendResponse(client, resp);
 }
 
 // Handle a directory request: try index file, then autoindex or 403.
@@ -413,6 +508,10 @@ void Server::serveDirectory(Client& client, const std::string& path) {
 // Handle GET: resolve path, stat, then delegate to file or directory handler.
 void Server::handleGet(Client& client) {
     std::string fullpath = resolvePath(client);
+    if (fullpath.empty()) {
+        buildErrorResponse(client, 403);
+        return;
+    }
 
     struct stat st;
     if (stat(fullpath.c_str(), &st) < 0) {
@@ -458,7 +557,7 @@ void Server::handlePost(Client& client) {
         resp.setContentType("text/html");
         std::string body = "<html><body><h1>201 Created</h1><p>File: " + filepath + "</p></body></html>";
         resp.setBody(body);
-        client.response = resp.toString();
+        sendResponse(client, resp);
     } else {
         HttpResponse resp;
         resp.setStatus(200);
@@ -468,13 +567,17 @@ void Server::handlePost(Client& client) {
              << "<p>Body size: " << client.request.body.size() << "</p>"
              << "</body></html>";
         resp.setBody(body.str());
-        client.response = resp.toString();
+        sendResponse(client, resp);
     }
 }
 
 // Handle DELETE: remove file from disk.
 void Server::handleDelete(Client& client) {
     std::string fullpath = resolvePath(client);
+    if (fullpath.empty()) {
+        buildErrorResponse(client, 403);
+        return;
+    }
 
     struct stat st;
     if (stat(fullpath.c_str(), &st) < 0) {
@@ -495,12 +598,16 @@ void Server::handleDelete(Client& client) {
     HttpResponse resp;
     resp.setStatus(204);
     resp.setBody("");
-    client.response = resp.toString();
+    sendResponse(client, resp);
 }
 
 // Handle CGI: fork + execve with pipes and environment.
 void Server::handleCGI(Client& client) {
     std::string script_path = resolvePath(client);
+    if (script_path.empty()) {
+        buildErrorResponse(client, 403);
+        return;
+    }
 
     int stdin_pipe[2];
     int stdout_pipe[2];
@@ -550,10 +657,12 @@ void Server::handleCGI(Client& client) {
         if (hit != client.request.headers.end())
             env_strings.push_back("CONTENT_TYPE=" + hit->second);
 
-        // ponytail: basic SCRIPT_NAME / PATH_INFO / PATH_TRANSLATED
         env_strings.push_back("SCRIPT_NAME=" + client.request.path);
         env_strings.push_back("PATH_INFO=");
         env_strings.push_back("PATH_TRANSLATED=" + script_path);
+        env_strings.push_back("REMOTE_ADDR=" + client.remote_addr);
+        env_strings.push_back("SERVER_SOFTWARE=webserv/1.0");
+        env_strings.push_back("GATEWAY_INTERFACE=CGI/1.1");
 
         hit = client.request.headers.find("host");
         if (hit != client.request.headers.end())
@@ -575,6 +684,7 @@ void Server::handleCGI(Client& client) {
         argv[1] = const_cast<char*>(script_path.c_str());
         argv[2] = NULL;
 
+        alarm(5);
         execve(argv[0], argv, &envp[0]);
         // If execve fails, try direct execution (for compiled CGI)
         argv[0] = const_cast<char*>(script_path.c_str());
@@ -652,7 +762,7 @@ void Server::handleCGI(Client& client) {
         resp.setBody(cgi_output);
     }
 
-    client.response = resp.toString();
+    sendResponse(client, resp);
 }
 
 // Close a client connection and mark its poll entry as dead.
@@ -664,4 +774,28 @@ void Server::closeClient(size_t idx) {
         fds_[idx].fd = -1;
         fds_[idx].events = 0;
     }
+}
+
+std::string Server::generateSessionId() const {
+    std::ostringstream oss;
+    oss << time(NULL) << "_" << rand();
+    return oss.str();
+}
+
+void Server::handleSession(Client& client) {
+    std::map<std::string, std::string>::const_iterator it = client.request.cookies.find("session_id");
+    std::string sid;
+    if (it != client.request.cookies.end()) {
+        sid = it->second;
+    } else {
+        sid = generateSessionId();
+        client.session_cookie = "session_id=" + sid + "; Path=/; HttpOnly";
+    }
+    sessions_[sid].count++;
+}
+
+void Server::sendResponse(Client& client, HttpResponse& resp) {
+    if (!client.session_cookie.empty())
+        resp.setCookie(client.session_cookie);
+    client.response = resp.toString();
 }

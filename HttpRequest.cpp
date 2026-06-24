@@ -128,8 +128,30 @@ void HttpRequest::parseHeaderLine(const std::string& line) {
 
     headers[key] = value;
 
+    if (key == "cookie")
+        parseCookies(value);
+
     if (key == "content-length")
         content_length_ = std::atol(value.c_str());
     else if (key == "transfer-encoding" && value.find("chunked") != std::string::npos)
         chunked_ = true;
+}
+
+void HttpRequest::parseCookies(const std::string& value) {
+    std::istringstream iss(value);
+    std::string pair;
+    while (std::getline(iss, pair, ';')) {
+        size_t eq = pair.find('=');
+        if (eq != std::string::npos) {
+            std::string ckey = pair.substr(0, eq);
+            std::string cval = pair.substr(eq + 1);
+            size_t start = ckey.find_first_not_of(" \t");
+            if (start != std::string::npos)
+                ckey = ckey.substr(start);
+            start = cval.find_first_not_of(" \t");
+            if (start != std::string::npos)
+                cval = cval.substr(start);
+            cookies[ckey] = cval;
+        }
+    }
 }

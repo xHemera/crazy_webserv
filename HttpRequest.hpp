@@ -17,11 +17,13 @@ public:
     std::string query_string;
     std::string http_version;
     std::map<std::string, std::string> headers;
+    std::map<std::string, std::string> cookies;
     std::string body;
 
 private:
     void parseRequestLine(const std::string& line);
     void parseHeaderLine(const std::string& line);
+    void parseCookies(const std::string& value);
 
     enum State { REQUEST_LINE, HEADERS, BODY, COMPLETE };
     enum ChunkState { CHUNK_SIZE, CHUNK_DATA };

@@ -12,6 +12,7 @@ public:
     void setHeader(const std::string& key, const std::string& value);
     void setBody(const std::string& body);
     void setContentType(const std::string& type);
+    void setCookie(const std::string& cookie);
 
     std::string toString() const;
     void clear();

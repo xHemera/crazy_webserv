@@ -40,3 +40,7 @@ make re      # full rebuild
 - [RFC 7231 - HTTP/1.1 Semantics](https://tools.ietf.org/html/rfc7231)
 - [NGINX documentation](https://nginx.org/en/docs/)
 - [CGI/1.1 specification](https://tools.ietf.org/html/rfc3875)
+
+### AI usage
+
+AI (OpenCode) was used to review the codebase, identify missing features (redirects, timeouts, virtual hosting, CGI env variables, path traversal protection), and implement the corresponding fixes. All changes were reviewed and tested before integration.

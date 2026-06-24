@@ -128,7 +128,6 @@ std::vector<ServerConfig> ConfigParser::parse(const std::string& filename)
     loadFile(filename);
     tokenize();
     std::vector<ServerConfig> configs = parseConfig();
-    checkDuplicatePorts(configs);
     return configs;
 }
 
