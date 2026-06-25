@@ -48,6 +48,10 @@ private:
     void handlePost(Client& client);
     void handleDelete(Client& client);
     void handleCGI(Client& client);
+
+    bool parseMultipartFile(const std::string& contentType, const std::string& body,
+                            std::string& filename, std::string& fileContent) const;
+    std::string sanitizeUploadFilename(const std::string& filename) const;
     void serveFile(Client& client, const std::string& path);
     void serveDirectory(Client& client, const std::string& path);
     void serveDirectoryListing(Client& client, const std::string& path);

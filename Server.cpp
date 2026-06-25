@@ -384,26 +384,17 @@ void Server::processRequest(Client& client) {
 
 // Resolve the filesystem path for a request: root + subpath after location prefix.
 std::string Server::resolvePath(const Client& client) const {
-    std::string subpath;
-    if (client.location->path == "/") {
-        subpath = client.request.path;
-    } else {
-        subpath = client.request.path.substr(client.location->path.size());
-        if (subpath.empty() || subpath[0] != '/')
-            subpath = client.request.path;
-    }
-    if (subpath.empty())
-        subpath = "/";
+    const std::string& uri = client.request.path;
 
     // Reject path traversal attempts
-    std::istringstream iss(subpath);
+    std::istringstream iss(uri);
     std::string segment;
     while (std::getline(iss, segment, '/')) {
         if (segment == "..")
             return "";
     }
 
-    return client.location->root + subpath;
+    return client.location->root + uri;
 }
 
 // Map file extension to MIME type.
@@ -527,26 +518,180 @@ void Server::handleGet(Client& client) {
         buildErrorResponse(client, 403);
 }
 
+// Extract boundary value from a multipart/form-data Content-Type header.
+static std::string extractBoundary(const std::string& contentType) {
+    std::string boundary;
+    size_t pos = contentType.find("boundary=");
+    if (pos == std::string::npos)
+        return boundary;
+    pos += std::string("boundary=").size();
+    if (pos < contentType.size() && contentType[pos] == '"') {
+        ++pos;
+        size_t end = contentType.find('"', pos);
+        if (end == std::string::npos)
+            return boundary;
+        boundary = contentType.substr(pos, end - pos);
+    } else {
+        size_t end = contentType.find(';', pos);
+        if (end == std::string::npos)
+            boundary = contentType.substr(pos);
+        else
+            boundary = contentType.substr(pos, end - pos);
+    }
+    return boundary;
+}
+
+// Parse a multipart/form-data body and extract the first uploaded file.
+bool Server::parseMultipartFile(const std::string& contentType, const std::string& body,
+                                std::string& filename, std::string& fileContent) const {
+    std::string boundary = extractBoundary(contentType);
+    if (boundary.empty())
+        return false;
+
+    std::string marker = "--" + boundary;
+
+    size_t partStart = body.find(marker);
+    if (partStart == std::string::npos)
+        return false;
+
+    // Skip the boundary line itself
+    size_t lineEnd = body.find("\r\n", partStart);
+    size_t nlLen = 2;
+    if (lineEnd == std::string::npos) {
+        lineEnd = body.find('\n', partStart);
+        nlLen = 1;
+    }
+    if (lineEnd == std::string::npos)
+        return false;
+    lineEnd += nlLen;
+
+    // Find end of part headers
+    size_t headerEnd = body.find("\r\n\r\n", lineEnd);
+    size_t headerSepLen = 4;
+    if (headerEnd == std::string::npos) {
+        headerEnd = body.find("\n\n", lineEnd);
+        headerSepLen = 2;
+    }
+    if (headerEnd == std::string::npos)
+        return false;
+
+    std::string headers = body.substr(lineEnd, headerEnd - lineEnd);
+
+    // Extract filename from Content-Disposition header
+    size_t fnPos = headers.find("filename=\"");
+    if (fnPos == std::string::npos) {
+        fnPos = headers.find("filename='");
+        if (fnPos == std::string::npos)
+            return false;
+        fnPos += std::string("filename='").size();
+    } else {
+        fnPos += std::string("filename=\"").size();
+    }
+    size_t fnEnd = headers.find(headers[fnPos - 1], fnPos);
+    if (fnEnd == std::string::npos)
+        return false;
+    filename = headers.substr(fnPos, fnEnd - fnPos);
+
+    size_t contentStart = headerEnd + headerSepLen;
+
+    // Find next boundary marker to know where the file content ends
+    size_t nextMarker = body.find(marker, contentStart);
+    if (nextMarker == std::string::npos)
+        return false;
+
+    // Strip the CRLF/LF that separates content from the boundary
+    size_t contentEnd = nextMarker;
+    if (contentEnd >= 2 && body.compare(contentEnd - 2, 2, "\r\n") == 0)
+        contentEnd -= 2;
+    else if (contentEnd >= 1 && body[contentEnd - 1] == '\n')
+        contentEnd -= 1;
+
+    if (contentEnd < contentStart)
+        contentEnd = contentStart;
+
+    fileContent = body.substr(contentStart, contentEnd - contentStart);
+    return true;
+}
+
+// Sanitize an uploaded filename for safe storage.
+std::string Server::sanitizeUploadFilename(const std::string& filename) const {
+    if (filename.empty())
+        return "";
+
+    // Keep only the base name, strip any path components
+    size_t pos = filename.find_last_of("/\\");
+    std::string base = (pos == std::string::npos) ? filename : filename.substr(pos + 1);
+
+    // Trim whitespace
+    size_t start = base.find_first_not_of(" \t\r\n");
+    size_t end = base.find_last_not_of(" \t\r\n");
+    if (start == std::string::npos)
+        return "";
+    base = base.substr(start, end - start + 1);
+
+    // Remove leading dots to avoid hidden/special files
+    while (!base.empty() && base[0] == '.')
+        base.erase(0, 1);
+
+    if (base.empty())
+        return "";
+
+    return base;
+}
+
 // Handle POST: write body to upload_store or acknowledge.
 void Server::handlePost(Client& client) {
     const std::string& upload_store = client.location->upload_store;
 
-    // ponytail: without upload_store, just acknowledge the body
-    if (!upload_store.empty()) {
-        std::ostringstream filename;
-        filename << time(NULL) << "_" << client.request.body.size();
+    std::string filename;
+    std::string fileContent;
+    bool isMultipart = false;
 
-        std::string filepath = upload_store + "/" + filename.str();
+    std::map<std::string, std::string>::const_iterator it = client.request.headers.find("content-type");
+    if (it != client.request.headers.end() && it->second.find("multipart/form-data") != std::string::npos) {
+        isMultipart = parseMultipartFile(it->second, client.request.body, filename, fileContent);
+    }
+
+    if (!upload_store.empty()) {
+        std::string dataToWrite;
+        size_t dataSize = 0;
+
+        if (isMultipart) {
+            dataToWrite = fileContent;
+            dataSize = fileContent.size();
+        } else {
+            dataToWrite = client.request.body;
+            dataSize = client.request.body.size();
+        }
+
+        std::string saveName;
+        if (isMultipart && !filename.empty()) {
+            std::string safe = sanitizeUploadFilename(filename);
+            if (!safe.empty()) {
+                std::ostringstream oss;
+                oss << time(NULL) << "_" << safe;
+                saveName = oss.str();
+            }
+        }
+        if (saveName.empty()) {
+            std::ostringstream oss;
+            oss << time(NULL) << "_" << dataSize;
+            saveName = oss.str();
+        }
+
+        std::string filepath = upload_store + "/" + saveName;
         int fd = open(filepath.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (fd < 0) {
             buildErrorResponse(client, 500);
             return;
         }
 
-        ssize_t written = write(fd, client.request.body.c_str(), client.request.body.size());
+        ssize_t written = 0;
+        if (dataSize > 0)
+            written = write(fd, dataToWrite.c_str(), dataSize);
         close(fd);
 
-        if (written < 0 || static_cast<size_t>(written) != client.request.body.size()) {
+        if (written < 0 || static_cast<size_t>(written) != dataSize) {
             unlink(filepath.c_str());
             buildErrorResponse(client, 500);
             return;
