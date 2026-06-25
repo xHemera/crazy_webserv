@@ -452,7 +452,34 @@ void Server::serveFile(Client& client, const std::string& path) {
     sendResponse(client, resp);
 }
 
-// Generate an HTML directory listing.
+static std::string escapeHtml(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        switch (s[i]) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&#39;"; break;
+            default: out += s[i];
+        }
+    }
+    return out;
+}
+
+// Format a file size in human-readable form.
+static std::string formatSize(off_t size) {
+    std::ostringstream oss;
+    if (size < 1024)
+        oss << size << " B";
+    else if (size < 1024 * 1024)
+        oss << (size / 1024) << " KB";
+    else
+        oss << (size / (1024 * 1024)) << " MB";
+    return oss.str();
+}
+
+// Generate an HTML directory listing with delete buttons.
 void Server::serveDirectoryListing(Client& client, const std::string& path) {
     DIR* dir = opendir(path.c_str());
     if (!dir) {
@@ -461,19 +488,92 @@ void Server::serveDirectoryListing(Client& client, const std::string& path) {
     }
 
     std::ostringstream html;
-    html << "<html><head><title>Index of " << client.request.path
-         << "</title></head><body>"
-         << "<h1>Index of " << client.request.path << "</h1><hr><ul>";
+    html << "<!DOCTYPE html>\n"
+         << "<html lang=\"en\">\n"
+         << "<head>\n"
+         << "    <meta charset=\"UTF-8\">\n"
+         << "    <title>Index of " << escapeHtml(client.request.path) << "</title>\n"
+         << "    <link rel=\"stylesheet\" href=\"/style.css\">\n"
+         << "    <link rel=\"icon\" href=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\">\n"
+         << "    <style>\n"
+         << "        .file-list { background: white; border-radius: 12px; padding: 25px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: left; margin-top: 30px; }\n"
+         << "        table { width: 100%; border-collapse: collapse; }\n"
+         << "        th, td { padding: 12px; border-bottom: 1px solid #eee; }\n"
+         << "        th { text-align: left; color: #7f8c8d; font-weight: 600; }\n"
+         << "        a { color: #3498db; text-decoration: none; }\n"
+         << "        a:hover { text-decoration: underline; }\n"
+         << "        .delete-btn { background: #e74c3c; color: white; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.9em; }\n"
+         << "        .delete-btn:hover { background: #c0392b; }\n"
+         << "        .back { display: inline-block; margin-top: 20px; color: #3498db; }\n"
+         << "    </style>\n"
+         << "</head>\n"
+         << "<body>\n"
+         << "    <div class=\"container\">\n"
+         << "        <h1>Index of " << escapeHtml(client.request.path) << "</h1>\n"
+         << "        <p class=\"subtitle\">Directory listing</p>\n"
+         << "        <div class=\"file-list\">\n"
+         << "            <table>\n"
+         << "                <tr><th>Name</th><th>Size</th><th>Modified</th><th>Action</th></tr>\n";
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL) {
         std::string name(entry->d_name);
         if (name == ".")
             continue;
-        html << "<li><a href=\"" << name << "\">" << name << "</a></li>";
+
+        std::string fullpath = path + "/" + name;
+        struct stat st;
+        std::string size_str = "-";
+        std::string mtime_str = "-";
+        if (stat(fullpath.c_str(), &st) == 0) {
+            if (S_ISREG(st.st_mode))
+                size_str = formatSize(st.st_size);
+            else if (S_ISDIR(st.st_mode))
+                size_str = "directory";
+
+            char time_buf[64];
+            struct tm* tm_info = localtime(&st.st_mtime);
+            if (tm_info && strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M", tm_info) > 0)
+                mtime_str = time_buf;
+        }
+
+        std::string display_name = escapeHtml(name);
+        std::string href_name = escapeHtml(name);
+        std::string uri = escapeHtml(client.request.path);
+        if (uri.empty() || uri[uri.size() - 1] != '/')
+            uri += "/";
+
+        html << "                <tr>\n"
+             << "                    <td><a href=\"" << href_name << "\">" << display_name << "</a></td>\n"
+             << "                    <td>" << size_str << "</td>\n"
+             << "                    <td>" << mtime_str << "</td>\n";
+
+        if (S_ISREG(st.st_mode)) {
+            html << "                    <td><button class=\"delete-btn\" onclick=\"deleteFile('" << href_name << "')\">Delete</button></td>\n";
+        } else {
+            html << "                    <td></td>\n";
+        }
+        html << "                </tr>\n";
     }
-    html << "</ul><hr></body></html>";
     closedir(dir);
+
+    html << "            </table>\n"
+         << "        </div>\n"
+         << "        <p><a href=\"/\" class=\"back\">&larr; Back to home</a></p>\n"
+         << "    </div>\n"
+         << "    <script>\n"
+         << "        function deleteFile(filename) {\n"
+         << "            if (!confirm('Delete ' + filename + '?')) return;\n"
+         << "            fetch(filename, { method: 'DELETE' })\n"
+         << "                .then(r => {\n"
+         << "                    if (r.ok) location.reload();\n"
+         << "                    else alert('Delete failed (status ' + r.status + ')');\n"
+         << "                })\n"
+         << "                .catch(e => alert('Error: ' + e));\n"
+         << "        }\n"
+         << "    </script>\n"
+         << "</body>\n"
+         << "</html>\n";
 
     HttpResponse resp;
     resp.setStatus(200);
