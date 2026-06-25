@@ -2,7 +2,7 @@ CXX = c++
 CXXFLAGS = -Wall -Wextra -Werror -std=c++98 -MMD
 NAME = webserv
 
-SRCS = main.cpp ConfigParser.cpp ServerConfig.cpp Server.cpp HttpRequest.cpp HttpResponse.cpp
+SRCS = main.cpp ConfigParser.cpp ServerConfig.cpp Server.cpp HttpRequest.cpp HttpResponse.cpp SignalHandler.cpp
 OBJS = $(SRCS:.cpp=.o)
 DEPS = $(OBJS:.o=.d)
 

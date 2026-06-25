@@ -1,4 +1,5 @@
 #include "Server.hpp"
+#include "SignalHandler.hpp"
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
@@ -21,9 +22,18 @@ Server::Server(const std::vector<ServerConfig>& configs)
 }
 
 Server::~Server() {
+    for (std::map<int, Client>::iterator it = clients_.begin(); it != clients_.end(); ++it)
+        if (it->first >= 0)
+            close(it->first);
+    clients_.clear();
+
     for (size_t i = 0; i < fds_.size(); ++i)
         if (fds_[i].fd >= 0)
             close(fds_[i].fd);
+    fds_.clear();
+
+    listen_configs_.clear();
+    sessions_.clear();
 }
 
 // Socket creation: one socket per unique host:port, multiple configs per port (virtual hosting).
@@ -135,15 +145,18 @@ void Server::cleanupDeadFds() {
 
 // Main loop: single poll() that monitors read + write readiness.
 void Server::run() {
-    while (true) {
+    while (g_running) {
         cleanupDeadFds();
         checkTimeouts();
 
-        int ret = poll(&fds_[0], fds_.size(), -1);
+        int ret = poll(&fds_[0], fds_.size(), 1000);
         if (ret < 0) {
-            std::cerr << "Error: poll() failed" << std::endl;
-            break;
+            if (!g_running)
+                break;
+            continue;
         }
+        if (ret == 0)
+            continue;
 
         for (size_t i = 0; i < fds_.size(); ++i) {
             if (fds_[i].revents == 0)
@@ -582,7 +595,7 @@ void Server::serveDirectoryListing(Client& client, const std::string& path) {
     sendResponse(client, resp);
 }
 
-// Handle a directory request: try index file, then autoindex or 403.
+// Handle a directory request: try index file, then directory listing.
 void Server::serveDirectory(Client& client, const std::string& path) {
     std::string index_path = path + "/" + client.location->index;
     struct stat st;
@@ -590,10 +603,7 @@ void Server::serveDirectory(Client& client, const std::string& path) {
         serveFile(client, index_path);
         return;
     }
-    if (client.location->autoindex)
-        serveDirectoryListing(client, path);
-    else
-        buildErrorResponse(client, 403);
+    serveDirectoryListing(client, path);
 }
 
 // Handle GET: resolve path, stat, then delegate to file or directory handler.

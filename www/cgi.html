@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CGI Test - webserv</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==">
+    <style>
+        .tabs {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 0;
+        }
+        .tab {
+            background: #e1e8ed;
+            border: none;
+            padding: 14px 32px;
+            border-radius: 12px 12px 0 0;
+            font-size: 1em;
+            cursor: pointer;
+            transition: background 0.2s;
+            color: #555;
+            font-weight: 600;
+        }
+        .tab.active {
+            background: white;
+            color: #3498db;
+        }
+        .tab:hover:not(.active) {
+            background: #d5dde4;
+        }
+        .tab-panel {
+            display: none;
+            background: white;
+            padding: 30px;
+            border-radius: 0 0 12px 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            max-width: 500px;
+            margin: 0 auto 30px;
+            text-align: left;
+        }
+        .tab-panel.active {
+            display: block;
+        }
+        .tab-panel h2 {
+            margin-top: 0;
+            color: #3498db;
+            font-size: 1.4em;
+        }
+        .method-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 0.85em;
+            margin-bottom: 20px;
+        }
+        .get { background: #2ecc71; color: white; }
+        .post { background: #e67e22; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>CGI Test</h1>
+        <p class="subtitle">Test GET and POST requests against CGI scripts</p>
+
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('get')">GET Request</button>
+            <button class="tab" onclick="showTab('post')">POST Request</button>
+        </div>
+
+        <div id="get" class="tab-panel active">
+            <span class="method-badge get">GET</span>
+            <h2>Send data via GET</h2>
+            <p>Parameters are appended to the URL as a query string. The CGI script will display them in <code>QUERY_STRING</code>.</p>
+            <form action="/cgi-bin/test.py" method="GET">
+                <label for="get-name">Name:</label>
+                <input type="text" id="get-name" name="name" placeholder="Your name">
+
+                <label for="get-message">Message:</label>
+                <textarea id="get-message" name="message" placeholder="Type something..."></textarea>
+
+                <button type="submit">Send GET to CGI</button>
+            </form>
+        </div>
+
+        <div id="post" class="tab-panel">
+            <span class="method-badge post">POST</span>
+            <h2>Send data via POST</h2>
+            <p>Parameters are sent in the request body. The CGI script will display <code>REQUEST_METHOD</code> and the parsed body.</p>
+            <form action="/cgi-bin/form.py" method="POST">
+                <label for="post-name">Name:</label>
+                <input type="text" id="post-name" name="name" placeholder="Your name">
+
+                <label for="post-message">Message:</label>
+                <textarea id="post-message" name="message" placeholder="Type something..."></textarea>
+
+                <button type="submit">Send POST to CGI</button>
+            </form>
+        </div>
+
+        <p><a href="/">&larr; Back to home</a></p>
+    </div>
+
+    <script>
+        function showTab(id) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.querySelector('.tab[onclick="showTab(\'' + id + '\')"]').classList.add('active');
+            document.getElementById(id).classList.add('active');
+        }
+    </script>
+</body>
+</html>

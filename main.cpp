@@ -1,5 +1,6 @@
 #include "ConfigParser.hpp"
 #include "Server.hpp"
+#include "SignalHandler.hpp"
 #include <iostream>
 
 int main(int argc, char** argv)
@@ -11,6 +12,8 @@ int main(int argc, char** argv)
         configs = parser.parse(argv[1]);
     else
         configs = parser.parseFromDefault();
+
+    setupSignalHandlers();
 
     Server server(configs);
     server.run();
